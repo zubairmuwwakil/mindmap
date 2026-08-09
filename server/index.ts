@@ -66,8 +66,14 @@ app.use((req, res, next) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
 
-    res.status(status).json({ message });
-    throw err;
+    // Log, don't rethrow. This handler used to `throw err` after answering the
+    // request: a synchronous throw inside Express's error middleware is an
+    // uncaughtException, so every handled error also killed the process. The
+    // client got its 500 and then the server went away.
+    log(`${status} ${message}`, "error");
+    if (err?.stack) console.error(err.stack);
+
+    if (!res.headersSent) res.status(status).json({ message });
   });
 
   // importantly only setup vite in development and after
