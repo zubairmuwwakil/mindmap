@@ -1,6 +1,7 @@
 import type { Express, Request, Response, NextFunction, RequestHandler } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
+import { pool } from "./db";
 import { insertMapSchema } from "@shared/schema";
 
 /**
@@ -27,6 +28,18 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  // Answers "is the database reachable?" without touching any table, so it can
+  // serve as Render's health check and as the one-line check after a restore.
+  app.get("/api/health", route(async (_req, res) => {
+    try {
+      await pool.query("select 1");
+      res.json({ ok: true, database: "up" });
+    } catch (err: any) {
+      console.error("[health] database check failed:", err?.message);
+      res.status(503).json({ ok: false, database: "down" });
+    }
+  }));
 
   app.get("/api/maps", route(async (_req, res) => {
     const maps = await storage.listMaps();

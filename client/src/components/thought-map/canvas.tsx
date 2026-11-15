@@ -20,6 +20,7 @@ import { useToast } from '@/hooks/use-toast';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiRequest } from '@/lib/queryClient';
 import { useHistory } from './use-history';
+import { readDraft, writeDraft } from './local-draft';
 
 const nodeTypes: NodeTypes = {
   thought: CustomNode,
@@ -93,26 +94,59 @@ function ThoughtCanvas() {
     queryKey: ['/api/maps'],
   });
 
+  /**
+   * Where saves are landing. 'server' means Postgres; 'local' means the API
+   * could not store it and the graph went to this browser's localStorage.
+   * The status pill renders this, so the two are never confused.
+   */
+  const [mode, setMode] = useState<'server' | 'local'>('server');
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const [saveState, setSaveState] = useState<'idle' | 'dirty' | 'saved' | 'failed'>('idle');
+
   const saveMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (): Promise<{ where: 'server'; id: number } | { where: 'local' }> => {
       const payload = { name: "My Mind Sky", nodes, edges };
-      if (currentMapId) {
-        return apiRequest("PATCH", `/api/maps/${currentMapId}`, payload).then(res => res.json());
-      } else {
-        return apiRequest("POST", "/api/maps", payload).then(res => res.json());
+      try {
+        const res = currentMapId
+          ? await apiRequest("PATCH", `/api/maps/${currentMapId}`, payload)
+          : await apiRequest("POST", "/api/maps", payload);
+        const data = await res.json();
+        return { where: 'server', id: data.id };
+      } catch (err) {
+        // The server is tried on every save, so the app recovers by itself
+        // once the database is back. Until then, keep the work in the browser.
+        if (writeDraft(nodes, edges)) return { where: 'local' };
+        throw err;
       }
     },
-    onSuccess: (data) => {
-      setCurrentMapId(data.id);
-      queryClient.invalidateQueries({ queryKey: ['/api/maps'] });
+    onSuccess: (result) => {
+      setSaveState('saved');
+      if (result.where === 'server') {
+        setCurrentMapId(result.id);
+        if (modeRef.current === 'local') {
+          toast({ title: "Back online", description: "Saving to the database again." });
+        }
+        setMode('server');
+        queryClient.invalidateQueries({ queryKey: ['/api/maps'] });
+        return;
+      }
+      if (modeRef.current === 'server') {
+        toast({
+          title: "Database offline: saving in this browser",
+          description: "Your sky is kept on this device until the server is back.",
+        });
+      }
+      setMode('local');
     },
     onError: () => {
-      // Without this the only signal of a failed save is its absence, which is
-      // indistinguishable from a save that worked.
+      // Neither the server nor the browser would store it. Say so plainly:
+      // the alternative is a "saved" UI over work that will not survive a reload.
+      setSaveState('failed');
       toast({
         variant: "destructive",
-        title: "Could not reach the clouds",
-        description: "Your thoughts are still here, but they are not saved yet.",
+        title: "Not saved",
+        description: "The server is unreachable and this browser would not store the map.",
       });
     },
   });
@@ -133,14 +167,24 @@ function ThoughtCanvas() {
    */
   useEffect(() => {
     if (hydratedRef.current || (!isSuccess && !isError)) return;
-    const latest = savedMaps?.[savedMaps.length - 1];
-    if (latest?.nodes?.length) {
-      const restored: Snapshot = { nodes: latest.nodes, edges: latest.edges ?? [] };
+    let restored: Snapshot | null = null;
+    if (isSuccess) {
+      const latest = savedMaps?.[savedMaps.length - 1];
+      if (latest?.nodes?.length) {
+        restored = { nodes: latest.nodes, edges: latest.edges ?? [] };
+        setCurrentMapId(latest.id);
+      }
+    } else {
+      // The API could not read the database: work from this browser's copy.
+      setMode('local');
+      const draft = readDraft<ThoughtNode, Edge>();
+      if (draft?.nodes.length) restored = { nodes: draft.nodes, edges: draft.edges };
+    }
+    if (restored) {
       applyingRef.current = true;
       restoringFromServerRef.current = true;
       setNodes(restored.nodes);
       setEdges(restored.edges);
-      setCurrentMapId(latest.id);
       // Reset rather than commit: the restored map is the start of history,
       // not a step the user can undo their way out of.
       history.reset(restored);
@@ -178,6 +222,7 @@ function ThoughtCanvas() {
       return;
     }
     dirtyRef.current = true;
+    setSaveState('dirty');
   }, [nodes, edges]);
 
   /**
@@ -318,6 +363,7 @@ function ThoughtCanvas() {
               MindSky
             </h1>
             <p className="text-blue-800/60 font-medium px-1">Press Delete/Backspace to pop bubbles or cut links.</p>
+            <SaveStatus mode={mode} state={saveMutation.isPending ? 'saving' : saveState} />
           </div>
         </Panel>
 
@@ -372,6 +418,39 @@ function ThoughtCanvas() {
           </div>
         </Panel>
       </ReactFlow>
+    </div>
+  );
+}
+
+/**
+ * Always-visible answer to "where is my work?". A toast says it once; this
+ * keeps saying it, which is what a visitor who missed the toast needs.
+ */
+function SaveStatus({ mode, state }: {
+  mode: 'server' | 'local';
+  state: 'idle' | 'dirty' | 'saving' | 'saved' | 'failed';
+}) {
+  const where = mode === 'server' ? 'database' : 'this browser';
+  const text =
+    state === 'saving' ? 'Saving…' :
+    state === 'dirty' ? 'Unsaved changes' :
+    state === 'failed' ? 'Not saved' :
+    state === 'saved' ? `Saved to ${where}` :
+    mode === 'server' ? 'Autosave on' : 'Offline mode';
+  const tone =
+    state === 'failed' ? 'bg-red-100 text-red-800 border-red-200' :
+    mode === 'local' ? 'bg-amber-100 text-amber-900 border-amber-200' :
+    'bg-white/60 text-blue-900 border-white/70';
+  return (
+    <div className="flex flex-col gap-1 px-1" data-testid="save-status" aria-live="polite">
+      <span className={`self-start text-xs font-semibold rounded-full border px-3 py-1 backdrop-blur-md ${tone}`}>
+        {text}
+      </span>
+      {mode === 'local' && (
+        <span className="text-xs text-amber-900/80 max-w-xs">
+          The database is unreachable, so your sky is saved on this device only.
+        </span>
+      )}
     </div>
   );
 }

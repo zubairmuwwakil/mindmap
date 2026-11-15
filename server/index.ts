@@ -73,7 +73,11 @@ app.use((req, res, next) => {
     log(`${status} ${message}`, "error");
     if (err?.stack) console.error(err.stack);
 
-    if (!res.headersSent) res.status(status).json({ message });
+    // 5xx messages are driver internals (e.g. "getaddrinfo ENOTFOUND dpg-…",
+    // which names the private database host). The client only needs to know
+    // the server failed; the detail stays in the log above.
+    const publicMessage = status >= 500 ? "Storage is unavailable" : message;
+    if (!res.headersSent) res.status(status).json({ message: publicMessage });
   });
 
   // importantly only setup vite in development and after
@@ -95,7 +99,8 @@ app.use((req, res, next) => {
     {
       port,
       host: "0.0.0.0",
-      reusePort: true,
+      // SO_REUSEPORT on 0.0.0.0 fails with ENOTSUP on macOS; Render is Linux.
+      reusePort: process.platform === "linux",
     },
     () => {
       log(`serving on port ${port}`);
