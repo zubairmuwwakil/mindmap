@@ -27,7 +27,7 @@ maps {
 
 ```
 React + @xyflow/react          Express API              PostgreSQL
-  canvas owns state    ──▶   read/write map    ──▶   nodes + edges
+  canvas owns state    ──▶   owner-scoped maps  ──▶   nodes + edges
   nodes are dumb             (Drizzle ORM)            as JSONB
         │
         └── history stack (snapshots) ──▶ debounced autosave
@@ -39,6 +39,8 @@ React + @xyflow/react          Express API              PostgreSQL
 - **History stack decoupled from the UI** — only meaningful actions (add, delete, connect, drag-end) commit a snapshot. Transient ones (dragging, selection) do not, so history never fills with noise and undo always moves a user-visible step.
 - **Debounced autosave that pauses during undo/redo and initial restore** — otherwise restoring a snapshot immediately writes it back, and an undo becomes unrepeatable.
 - **The canvas owns state and behaviour; nodes are purely presentational** — the separation that keeps the graph logic testable independently of rendering.
+- **Private maps per browser** — the API issues a random HTTP-only cookie, stores its hash with each map, and scopes reads and writes to that hash. A matching request token protects changes. There are no portable user accounts yet; clearing both the cookie and local storage loses access to that browser's maps.
+- **Offline recovery** — browser drafts are compared with server `updatedAt` on startup; a newer draft is restored and synced. Successful saves also keep a local backup with the server timestamp.
 
 ## Tech stack
 
@@ -66,6 +68,11 @@ npm run dev
 | Variable | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | yes | PostgreSQL connection string |
+| `MINDSKY_LEGACY_CLAIM_CODE` | only for migration | A random code of at least 32 characters for assigning pre-ownership maps to your browser. Generate with `openssl rand -hex 32`; set it as a server environment variable, never in client code. |
+
+### Recover maps from before private storage
+
+The server adds the nullable `owner_hash` column automatically. Existing maps remain in the database but are hidden until claimed. Set `MINDSKY_LEGACY_CLAIM_CODE` on the server before deploying this version, then open MindSky in your browser and use **Recover older maps**. Enter the code once; all unassigned maps move into that browser's private space. Remove the environment variable after recovery. If the code is absent, legacy maps stay intact and hidden.
 
 **Scripts**
 

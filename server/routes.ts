@@ -3,6 +3,17 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { pool } from "./db";
 import { insertMapSchema } from "@shared/schema";
+import { identifyVisitor, requireCsrf, validLegacyClaimCode, type Visitor } from "./visitor";
+
+function publicMap<T extends { ownerHash: string | null }>(map: T): Omit<T, "ownerHash"> {
+  const { ownerHash: _ownerHash, ...visible } = map;
+  return visible;
+}
+
+function mapId(value: string): number | null {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
 
 /**
  * Forward a rejected async handler to Express's error middleware.
@@ -41,31 +52,55 @@ export async function registerRoutes(
     }
   }));
 
+  app.get("/api/session", identifyVisitor, (_req, res) => {
+    res.json({ csrfToken: (res.locals.visitor as Visitor).csrfToken });
+  });
+
+  app.use("/api/maps", identifyVisitor);
+
   app.get("/api/maps", route(async (_req, res) => {
-    const maps = await storage.listMaps();
-    res.json(maps);
+    const ownerHash = (res.locals.visitor as Visitor).ownerHash;
+    const maps = await storage.listMaps(ownerHash);
+    res.json(maps.map(publicMap));
+  }));
+
+  app.post("/api/maps/claim-legacy", requireCsrf, route(async (req, res) => {
+    if (!validLegacyClaimCode(req.body?.code)) return res.status(403).json({ message: "Invalid recovery code" });
+    const ownerHash = (res.locals.visitor as Visitor).ownerHash;
+    const claimed = await storage.claimLegacyMaps(ownerHash);
+    res.json({ maps: claimed.map(publicMap) });
   }));
 
   app.get("/api/maps/:id", route(async (req, res) => {
-    const map = await storage.getMap(Number(req.params.id));
+    const id = mapId(req.params.id);
+    if (!id) return res.status(404).send("Map not found");
+    const map = await storage.getMap(id, (res.locals.visitor as Visitor).ownerHash);
     if (!map) return res.status(404).send("Map not found");
-    res.json(map);
+    res.json(publicMap(map));
   }));
 
-  app.post("/api/maps", route(async (req, res) => {
-    const parsed = insertMapSchema.safeParse(req.body);
+  app.post("/api/maps", requireCsrf, route(async (req, res) => {
+    const parsed = insertMapSchema.strict().safeParse(req.body);
     if (!parsed.success) return res.status(400).json(parsed.error);
-    const map = await storage.createMap(parsed.data);
-    res.json(map);
+    const map = await storage.createMap(parsed.data, (res.locals.visitor as Visitor).ownerHash);
+    res.json(publicMap(map));
   }));
 
-  app.patch("/api/maps/:id", route(async (req, res) => {
-    const map = await storage.updateMap(Number(req.params.id), req.body);
-    res.json(map);
+  app.patch("/api/maps/:id", requireCsrf, route(async (req, res) => {
+    const id = mapId(req.params.id);
+    if (!id) return res.status(404).send("Map not found");
+    const parsed = insertMapSchema.partial().strict().safeParse(req.body);
+    if (!parsed.success) return res.status(400).json(parsed.error);
+    const map = await storage.updateMap(id, (res.locals.visitor as Visitor).ownerHash, parsed.data);
+    if (!map) return res.status(404).send("Map not found");
+    res.json(publicMap(map));
   }));
 
-  app.delete("/api/maps/:id", route(async (req, res) => {
-    await storage.deleteMap(Number(req.params.id));
+  app.delete("/api/maps/:id", requireCsrf, route(async (req, res) => {
+    const id = mapId(req.params.id);
+    if (!id) return res.status(404).send("Map not found");
+    const deleted = await storage.deleteMap(id, (res.locals.visitor as Visitor).ownerHash);
+    if (!deleted) return res.status(404).send("Map not found");
     res.sendStatus(204);
   }));
 

@@ -10,8 +10,8 @@
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
     "db:push": "drizzle-kit push",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "vitest run --root .",
+    "test:watch": "vitest --root ."
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",

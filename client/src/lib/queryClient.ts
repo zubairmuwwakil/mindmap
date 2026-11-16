@@ -12,9 +12,18 @@ export async function apiRequest(
   url: string,
   data?: unknown | undefined,
 ): Promise<Response> {
+  let csrfToken: string | undefined;
+  if (method !== "GET" && method !== "HEAD") {
+    const session = await fetch("/api/session", { credentials: "include", cache: "no-store" });
+    await throwIfResNotOk(session);
+    csrfToken = (await session.json()).csrfToken;
+  }
   const res = await fetch(url, {
     method,
-    headers: data ? { "Content-Type": "application/json" } : {},
+    headers: {
+      ...(data ? { "Content-Type": "application/json" } : {}),
+      ...(csrfToken ? { "X-MindSky-CSRF": csrfToken } : {}),
+    },
     body: data ? JSON.stringify(data) : undefined,
     credentials: "include",
   });
