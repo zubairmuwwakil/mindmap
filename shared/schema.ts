@@ -15,6 +15,7 @@ export const maps = pgTable("maps", {
   nodes: jsonb("nodes").$type<any[]>().notNull(),
   edges: jsonb("edges").$type<any[]>().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  ownerHash: text("owner_hash"),
 });
 
 export const insertUserSchema = createInsertSchema(users).pick({
@@ -22,7 +23,7 @@ export const insertUserSchema = createInsertSchema(users).pick({
   password: true,
 });
 
-export const insertMapSchema = createInsertSchema(maps).omit({ id: true, updatedAt: true });
+export const insertMapSchema = createInsertSchema(maps).omit({ id: true, updatedAt: true, ownerHash: true });
 
 export type User = typeof users.$inferSelect;
 export type InsertUser = z.infer<typeof insertUserSchema>;

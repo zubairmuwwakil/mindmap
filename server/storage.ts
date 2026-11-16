@@ -1,6 +1,23 @@
 import { type User, type InsertUser, type Map, type InsertMap, users, maps } from "@shared/schema";
 import { db } from "./db";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
+import { pool } from "./db";
+
+// Additive migration: existing shared rows stay intact for the one-time claim.
+// Retry after database outages so the static app can still serve offline mode.
+let ownershipSchemaReady: Promise<void> | undefined;
+export function ensureMapOwnershipSchema(): Promise<void> {
+  if (!ownershipSchemaReady) {
+    ownershipSchemaReady = (async () => {
+      await pool.query("ALTER TABLE maps ADD COLUMN IF NOT EXISTS owner_hash text");
+      await pool.query("CREATE INDEX IF NOT EXISTS maps_owner_hash_updated_at_idx ON maps (owner_hash, updated_at)");
+    })().catch((error) => {
+      ownershipSchemaReady = undefined;
+      throw error;
+    });
+  }
+  return ownershipSchemaReady;
+}
 
 export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
@@ -8,11 +25,12 @@ export interface IStorage {
   createUser(user: InsertUser): Promise<User>;
   
   // Map operations
-  getMap(id: number): Promise<Map | undefined>;
-  listMaps(): Promise<Map[]>;
-  createMap(map: InsertMap): Promise<Map>;
-  updateMap(id: number, map: Partial<InsertMap>): Promise<Map>;
-  deleteMap(id: number): Promise<void>;
+  getMap(id: number, ownerHash: string): Promise<Map | undefined>;
+  listMaps(ownerHash: string): Promise<Map[]>;
+  createMap(map: InsertMap, ownerHash: string): Promise<Map>;
+  updateMap(id: number, ownerHash: string, map: Partial<InsertMap>): Promise<Map | undefined>;
+  deleteMap(id: number, ownerHash: string): Promise<boolean>;
+  claimLegacyMaps(ownerHash: string): Promise<Map[]>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -31,32 +49,42 @@ export class DatabaseStorage implements IStorage {
     return user;
   }
 
-  async getMap(id: number): Promise<Map | undefined> {
-    const [map] = await db.select().from(maps).where(eq(maps.id, id));
+  async getMap(id: number, ownerHash: string): Promise<Map | undefined> {
+    await ensureMapOwnershipSchema();
+    const [map] = await db.select().from(maps).where(and(eq(maps.id, id), eq(maps.ownerHash, ownerHash)));
     return map;
   }
 
-  async listMaps(): Promise<Map[]> {
-    return await db.select().from(maps).orderBy(maps.updatedAt);
+  async listMaps(ownerHash: string): Promise<Map[]> {
+    await ensureMapOwnershipSchema();
+    return await db.select().from(maps).where(eq(maps.ownerHash, ownerHash)).orderBy(maps.updatedAt);
   }
 
-  async createMap(insertMap: InsertMap): Promise<Map> {
-    const [map] = await db.insert(maps).values(insertMap).returning();
+  async createMap(insertMap: InsertMap, ownerHash: string): Promise<Map> {
+    await ensureMapOwnershipSchema();
+    const [map] = await db.insert(maps).values({ ...insertMap, ownerHash }).returning();
     return map;
   }
 
-  async updateMap(id: number, update: Partial<InsertMap>): Promise<Map> {
+  async updateMap(id: number, ownerHash: string, update: Partial<InsertMap>): Promise<Map | undefined> {
+    await ensureMapOwnershipSchema();
     const [map] = await db
       .update(maps)
       .set({ ...update, updatedAt: new Date() })
-      .where(eq(maps.id, id))
+      .where(and(eq(maps.id, id), eq(maps.ownerHash, ownerHash)))
       .returning();
-    if (!map) throw new Error("Map not found");
     return map;
   }
 
-  async deleteMap(id: number): Promise<void> {
-    await db.delete(maps).where(eq(maps.id, id));
+  async deleteMap(id: number, ownerHash: string): Promise<boolean> {
+    await ensureMapOwnershipSchema();
+    const deleted = await db.delete(maps).where(and(eq(maps.id, id), eq(maps.ownerHash, ownerHash))).returning({ id: maps.id });
+    return deleted.length > 0;
+  }
+
+  async claimLegacyMaps(ownerHash: string): Promise<Map[]> {
+    await ensureMapOwnershipSchema();
+    return await db.update(maps).set({ ownerHash }).where(isNull(maps.ownerHash)).returning();
   }
 }
 

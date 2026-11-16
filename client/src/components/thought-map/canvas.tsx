@@ -15,12 +15,14 @@ import '@xyflow/react/dist/style.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import CustomNode, { ThoughtNode } from './custom-node';
 import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
 import { Plus, Trash2, MousePointer2, Cloud, Save, Layout, Undo2, Redo2 } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiRequest } from '@/lib/queryClient';
 import { useHistory } from './use-history';
-import { readDraft, writeDraft } from './local-draft';
+import { isDraftNewer, readDraft, writeDraft } from './local-draft';
 
 const nodeTypes: NodeTypes = {
   thought: CustomNode,
@@ -56,7 +58,7 @@ const initialEdges: Edge[] = [
 type Snapshot = { nodes: ThoughtNode[]; edges: Edge[] };
 
 /** Shape of a row from GET /api/maps. */
-type SavedMap = { id: number; name: string; nodes: ThoughtNode[]; edges: Edge[] };
+type SavedMap = { id: number; name: string; nodes: ThoughtNode[]; edges: Edge[]; updatedAt: string };
 
 /**
  * Long enough that a burst of edits — dragging three bubbles into place, or
@@ -69,6 +71,9 @@ function ThoughtCanvas() {
   const [nodes, setNodes, onNodesChange] = useNodesState<ThoughtNode>(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const [currentMapId, setCurrentMapId] = useState<number | null>(null);
+  const [claimOpen, setClaimOpen] = useState(false);
+  const [claimCode, setClaimCode] = useState('');
+  const [claimBusy, setClaimBusy] = useState(false);
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const history = useHistory<Snapshot>({ nodes: initialNodes, edges: initialEdges });
@@ -84,9 +89,8 @@ function ThoughtCanvas() {
   const pendingCommitRef = useRef(false);
   // False until the server's answer (or its failure) has been dealt with.
   const hydratedRef = useRef(false);
-  // Set while the server's map is being installed, so that restoring a map does
-  // not immediately save back the thing we just read.
-  const restoringFromServerRef = useRef(false);
+  // The initial render and any restored graph are setup, not user edits.
+  const skipDirtyEffectsRef = useRef(0);
   // Whether the graph has changed since the last save was dispatched.
   const dirtyRef = useRef(false);
 
@@ -105,14 +109,15 @@ function ThoughtCanvas() {
   const [saveState, setSaveState] = useState<'idle' | 'dirty' | 'saved' | 'failed'>('idle');
 
   const saveMutation = useMutation({
-    mutationFn: async (): Promise<{ where: 'server'; id: number } | { where: 'local' }> => {
+    mutationFn: async (): Promise<{ where: 'server'; id: number; updatedAt: string; snapshot: Snapshot } | { where: 'local' }> => {
       const payload = { name: "My Mind Sky", nodes, edges };
+      const snapshot = { nodes, edges };
       try {
         const res = currentMapId
           ? await apiRequest("PATCH", `/api/maps/${currentMapId}`, payload)
           : await apiRequest("POST", "/api/maps", payload);
         const data = await res.json();
-        return { where: 'server', id: data.id };
+        return { where: 'server', id: data.id, updatedAt: data.updatedAt, snapshot };
       } catch (err) {
         // The server is tried on every save, so the app recovers by itself
         // once the database is back. Until then, keep the work in the browser.
@@ -124,6 +129,9 @@ function ThoughtCanvas() {
       setSaveState('saved');
       if (result.where === 'server') {
         setCurrentMapId(result.id);
+        // Match the server timestamp so this backup will not trigger a needless
+        // resave on every visit, but can recover from a cleared identity cookie.
+        writeDraft(result.snapshot.nodes, result.snapshot.edges, result.updatedAt);
         if (modeRef.current === 'local') {
           toast({ title: "Back online", description: "Saving to the database again." });
         }
@@ -170,27 +178,34 @@ function ThoughtCanvas() {
     let restored: Snapshot | null = null;
     if (isSuccess) {
       const latest = savedMaps?.[savedMaps.length - 1];
-      if (latest?.nodes?.length) {
+      const draft = readDraft<ThoughtNode, Edge>();
+      if (latest && Array.isArray(latest.nodes)) {
         restored = { nodes: latest.nodes, edges: latest.edges ?? [] };
         setCurrentMapId(latest.id);
+      }
+      if (draft && isDraftNewer(draft.savedAt, latest?.updatedAt)) {
+        restored = { nodes: draft.nodes, edges: draft.edges };
+        dirtyRef.current = true;
+        setSaveState('dirty');
+        toast({ title: "Recovered newer browser draft", description: "Your latest sky will sync to the database." });
       }
     } else {
       // The API could not read the database: work from this browser's copy.
       setMode('local');
       const draft = readDraft<ThoughtNode, Edge>();
-      if (draft?.nodes.length) restored = { nodes: draft.nodes, edges: draft.edges };
+      if (draft) restored = { nodes: draft.nodes, edges: draft.edges };
     }
     if (restored) {
       applyingRef.current = true;
-      restoringFromServerRef.current = true;
       setNodes(restored.nodes);
       setEdges(restored.edges);
       // Reset rather than commit: the restored map is the start of history,
       // not a step the user can undo their way out of.
       history.reset(restored);
     }
+    skipDirtyEffectsRef.current = restored ? 2 : 1;
     hydratedRef.current = true;
-  }, [savedMaps, isSuccess, isError, setNodes, setEdges, history]);
+  }, [savedMaps, isSuccess, isError, setNodes, setEdges, history, toast]);
 
   /** Flag the change that is about to happen as worth a history entry. */
   const markMeaningful = useCallback(() => {
@@ -217,8 +232,8 @@ function ThoughtCanvas() {
   /** Any change to the graph leaves the server's copy out of date. */
   useEffect(() => {
     if (!hydratedRef.current) return;
-    if (restoringFromServerRef.current) {
-      restoringFromServerRef.current = false;
+    if (skipDirtyEffectsRef.current > 0) {
+      skipDirtyEffectsRef.current -= 1;
       return;
     }
     dirtyRef.current = true;
@@ -324,6 +339,41 @@ function ThoughtCanvas() {
     }
   };
 
+  const claimOlderMaps = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!claimCode || claimBusy) return;
+    setClaimBusy(true);
+    try {
+      const response = await apiRequest('POST', '/api/maps/claim-legacy', { code: claimCode });
+      const result: { maps: SavedMap[] } = await response.json();
+      if (!result.maps.length) {
+        toast({ title: 'No older maps to recover' });
+        return;
+      }
+      const latest = [...result.maps].sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt)).at(-1)!;
+      const snapshot = { nodes: latest.nodes, edges: latest.edges };
+      applyingRef.current = true;
+      skipDirtyEffectsRef.current = 1;
+      pendingCommitRef.current = false;
+      dirtyRef.current = false;
+      setNodes(snapshot.nodes);
+      setEdges(snapshot.edges);
+      history.reset(snapshot);
+      setCurrentMapId(latest.id);
+      setSaveState('saved');
+      setMode('server');
+      writeDraft(snapshot.nodes, snapshot.edges, latest.updatedAt);
+      setClaimOpen(false);
+      setClaimCode('');
+      queryClient.invalidateQueries({ queryKey: ['/api/maps'] });
+      toast({ title: `Recovered ${result.maps.length} older map${result.maps.length === 1 ? '' : 's'}` });
+    } catch {
+      toast({ variant: 'destructive', title: 'Recovery failed', description: 'Check the recovery code and try again.' });
+    } finally {
+      setClaimBusy(false);
+    }
+  };
+
   return (
     <div className="w-full h-screen relative overflow-hidden">
       <div className="absolute inset-0 pointer-events-none opacity-40 z-0">
@@ -364,6 +414,25 @@ function ThoughtCanvas() {
             </h1>
             <p className="text-blue-800/60 font-medium px-1">Press Delete/Backspace to pop bubbles or cut links.</p>
             <SaveStatus mode={mode} state={saveMutation.isPending ? 'saving' : saveState} />
+            {isSuccess && savedMaps?.length === 0 && (
+              <Dialog open={claimOpen} onOpenChange={setClaimOpen}>
+                <DialogTrigger asChild>
+                  <Button variant="link" size="sm" className="self-start px-1 text-blue-900">Recover older maps</Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <form onSubmit={claimOlderMaps} className="space-y-4">
+                    <DialogHeader>
+                      <DialogTitle>Recover older maps</DialogTitle>
+                      <DialogDescription>Enter the one-time recovery code to move existing maps into this browser’s private space.</DialogDescription>
+                    </DialogHeader>
+                    <Input type="password" autoComplete="off" aria-label="Recovery code" value={claimCode} onChange={(event) => setClaimCode(event.target.value)} required />
+                    <DialogFooter>
+                      <Button type="submit" disabled={claimBusy}>{claimBusy ? 'Recovering…' : 'Recover maps'}</Button>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
+            )}
           </div>
         </Panel>
 

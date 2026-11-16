@@ -26,12 +26,21 @@ export function readDraft<N, E>(): LocalDraft<N, E> | null {
 }
 
 /** Returns false when the browser would not store it either. */
-export function writeDraft<N, E>(nodes: N[], edges: E[]): boolean {
+export function writeDraft<N, E>(nodes: N[], edges: E[], savedAt = new Date().toISOString()): boolean {
   try {
-    const draft: LocalDraft<N, E> = { nodes, edges, savedAt: new Date().toISOString() };
+    const draft: LocalDraft<N, E> = { nodes, edges, savedAt };
     window.localStorage.setItem(KEY, JSON.stringify(draft));
     return true;
   } catch {
     return false;
   }
+}
+
+/** Keep a draft only when it was saved after the server's last update. */
+export function isDraftNewer(savedAt: string, serverUpdatedAt?: string): boolean {
+  const draftTime = Date.parse(savedAt);
+  if (!Number.isFinite(draftTime)) return false;
+  if (!serverUpdatedAt) return true;
+  const serverTime = Date.parse(serverUpdatedAt);
+  return Number.isFinite(serverTime) && draftTime > serverTime;
 }
