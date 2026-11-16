@@ -238,7 +238,7 @@ function ThoughtCanvas() {
     }
     dirtyRef.current = true;
     setSaveState('dirty');
-  }, [nodes, edges]);
+  }, [nodes, edges, isSuccess, isError]);
 
   /**
    * Debounced autosave.
